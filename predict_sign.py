@@ -11,7 +11,10 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
 import mediapipe as mp
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import HolisticLandmarker
 from PIL import ImageFont, ImageDraw, Image
+import urllib.request
 
 _native_stderr_silenced = False
 
@@ -34,6 +37,19 @@ THAI_FONT_PATHS = [
     "C:/Windows/Fonts/arialuni.ttf",
     "C:/Windows/Fonts/cordia.ttc",
 ]
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "holistic_landmarker.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "holistic_landmarker/holistic_landmarker/float16/1/holistic_landmarker.task"
+)
+
+def download_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading holistic_landmarker.task ...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Download complete.")
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -313,13 +329,18 @@ def main():
         print(f"Expected by scaler: {expected_feature_size} | New feature size: {new_feature_size}")
     print(f"ทดลองใช้ได้ตอนนี้: {', '.join(label_classes)}")
 
-    holistic = mp.solutions.holistic.Holistic(
-        static_image_mode=False,
-        model_complexity=1,
-        refine_face_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    download_model()
+    base_options = mp.tasks.BaseOptions(model_asset_path=MODEL_PATH)
+    holistic_options = vision.HolisticLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        min_face_detection_confidence=0.5,
+        min_pose_detection_confidence=0.5,
+        min_hand_landmarks_confidence=0.5,
+        min_face_landmarks_confidence=0.5,
+        min_pose_landmarks_confidence=0.5,
     )
+    holistic = HolisticLandmarker.create_from_options(holistic_options)
     silence_native_stderr()
 
     cap = open_webcam()
@@ -354,13 +375,13 @@ def main():
 
         mediapipe_frame = prepare_frame_for_mediapipe(frame)
         image = cv2.cvtColor(mediapipe_frame, cv2.COLOR_BGR2RGB)
-        image.flags.writeable = False
-        results = holistic.process(image)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+        results = holistic.detect(mp_image)
 
-        face_lms = results.face_landmarks.landmark if results.face_landmarks else []
-        pose_lms = results.pose_landmarks.landmark if results.pose_landmarks else []
-        left_lms = results.left_hand_landmarks.landmark if results.left_hand_landmarks else []
-        right_lms = results.right_hand_landmarks.landmark if results.right_hand_landmarks else []
+        face_lms = results.face_landmarks if results.face_landmarks else []
+        pose_lms = results.pose_landmarks if results.pose_landmarks else []
+        left_lms = results.left_hand_landmarks if results.left_hand_landmarks else []
+        right_lms = results.right_hand_landmarks if results.right_hand_landmarks else []
         has_hand = bool(left_lms or right_lms)
 
         if has_hand:

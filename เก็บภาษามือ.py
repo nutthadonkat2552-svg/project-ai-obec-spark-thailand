@@ -3,6 +3,7 @@ import os
 import time
 import traceback
 import sys
+import shutil
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -47,7 +48,7 @@ def download_model():
 
 
 # Configuration
-labels = ["สวัสดี", "ขอบคุณ", "ขอโทษ", "ใช่", "ไม่", "ฉัน", "พูดไม่ได้"]
+labels = ["สวัสดี", "ขอบคุณ", "ขอโทษ", "ใช่", "ไม่", "ฉัน", "พูดไม่ได้","หิว","ทำไม"]
 MAX_SEQUENCES = None
 output_file = os.path.join(BASE_DIR, "thai_holistic_motion_data.json")
 DATA_DIR = os.path.join(BASE_DIR, "pose")
@@ -139,9 +140,21 @@ def load_json_file(path, default):
         return json.load(f)
 
 
+def backup_file(path):
+    if os.path.exists(path):
+        bak_path = f"{path}.bak"
+        try:
+            shutil.copy2(path, bak_path)
+            print(f"Backup saved: {bak_path}")
+        except Exception as e:
+            print(f"WARNING: ไม่สามารถสำรองไฟล์ {path} ได้: {e}")
+
+
 def save_label_data(label, sequences):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(label_data_path(label), "w", encoding="utf-8") as f:
+    path = label_data_path(label)
+    backup_file(path)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(sequences, f, ensure_ascii=False)
 
 
@@ -150,6 +163,7 @@ def save_combined_data(data_by_label):
     for label in labels:
         combined.extend(data_by_label.get(label, []))
 
+    backup_file(output_file)
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(combined, f, ensure_ascii=False)
 
@@ -388,9 +402,6 @@ def open_webcam():
         for backend_name, backend in backends:
             print(f"Trying webcam index {camera_index} with {backend_name}...")
             cap = cv2.VideoCapture(camera_index, backend)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
             time.sleep(0.5)
 
             if not cap.isOpened():
@@ -440,7 +451,9 @@ def main():
         return
 
     failed_frames = 0
-    print("กด 1-7 เลือกท่า, A/D เลื่อนท่า, R หรือ Space เริ่มอัด, S หรือ Space เซฟ, C ยกเลิกคลิปนี้, U ลบ sequence ล่าสุด, Q ออก")
+    print(f"กด 1-{min(len(labels), 9)} เลือกท่าโดยตรง, 0 เลือกท่า 10, A/D เลื่อนท่าก่อนหน้า/ถัดไป, R หรือ Space เริ่มอัด, S หรือ Space เซฟ, C ยกเลิกคลิปนี้, U ลบ sequence ล่าสุด, Q ออก")
+    if len(labels) > 9:
+        print("หมายเหตุ: ถ้ามีท่ามากกว่า 10 ท่า ให้ใช้ A/D เลื่อนเลือกท่า")
     print(f"ข้อมูลจะแยกไฟล์ตามท่าไว้ในโฟลเดอร์: {DATA_DIR}")
     print(f"และจะอัปเดตไฟล์รวมไว้ที่: {output_file}")
 
@@ -490,15 +503,21 @@ def main():
         frame = draw_text_thai(frame, line1, pos=(10, 10), color=(255, 255, 255), size=24)
         frame = draw_text_thai(frame, line2, pos=(10, 38), color=counter_color, size=22)
 
-        y = frame.shape[0] - (len(labels) * 26) - 8
+        max_rows = 10
+        x_base = 10
+        x_step = 320
+        y = frame.shape[0] - (min(len(labels), max_rows) * 26) - 8
         for i, lbl in enumerate(labels):
             c = label_counts.get(lbl, 0)
+            col = i // max_rows
+            row = i % max_rows
+            x = x_base + col * x_step
             frame = draw_text_thai(
                 frame,
                 f"{i + 1}. {lbl}: {c} sequences",
-                pos=(10, y + i * 26),
+                pos=(x, y + row * 26),
                 color=(255, 255, 255),
-                size=20,
+                size=18,
             )
 
         draw_face_points(frame, face_lms)
@@ -513,12 +532,20 @@ def main():
 
         if key_char == "q":
             break
-        elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7")):
-            current_index = key - ord("1")
-            current_label = labels[current_index]
-            recording = False
-            motion_sequence = []
-            skipped_frames = 0
+        elif key_char.isdigit():
+            if key_char == "0" and len(labels) >= 10:
+                current_index = 9
+            else:
+                number = int(key_char)
+                if 1 <= number <= len(labels):
+                    current_index = number - 1
+                else:
+                    current_index = None
+            if current_index is not None and current_index < len(labels):
+                current_label = labels[current_index]
+                recording = False
+                motion_sequence = []
+                skipped_frames = 0
         elif key_char == "a":
             current_index = (current_index - 1) % len(labels)
             current_label = labels[current_index]
