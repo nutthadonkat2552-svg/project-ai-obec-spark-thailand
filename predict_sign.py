@@ -5,16 +5,236 @@ import os
 import time
 import traceback
 import sys
+import threading
+import re
+
+try:
+    import pyttsx3
+    _TTS_AVAILABLE = True
+except Exception:
+    pyttsx3 = None
+    _TTS_AVAILABLE = False
+
+try:
+    import winsound
+    _WINSOUND_AVAILABLE = True
+except Exception:
+    winsound = None
+    _WINSOUND_AVAILABLE = False
+
+# Initialize TTS engine once (if available) to avoid per-announcement overhead
+_tts_engine = None
+if _TTS_AVAILABLE:
+    try:
+        _tts_engine = pyttsx3.init()
+    except Exception:
+        _tts_engine = None
+        _TTS_AVAILABLE = False
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIO_LABELS_DIR = os.path.join(BASE_DIR, "audio_labels")
+
+
+def _safe_label_filename(text):
+    filename = text.strip()
+    filename = re.sub(r"[\\/:*?\"<>|]+", "_", filename)
+    filename = re.sub(r"\s+", "_", filename)
+    if not filename:
+        filename = "label"
+    return filename
+
+
+def _get_label_audio_path(text):
+    return os.path.join(AUDIO_LABELS_DIR, f"{_safe_label_filename(text)}.wav")
+
+
+def _generate_tone_wav_file(path, freq=750, ms=300, volume=0.3, sample_rate=44100):
+    import struct, math, wave
+    num_samples = int(sample_rate * (ms / 1000.0))
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        max_amp = int(32767 * volume)
+        for i in range(num_samples):
+            t = float(i) / sample_rate
+            val = int(max_amp * math.sin(2.0 * math.pi * freq * t))
+            wf.writeframes(struct.pack('<h', val))
+
+
+def _save_label_audio_file(path, text):
+    os.makedirs(AUDIO_LABELS_DIR, exist_ok=True)
+    if os.path.exists(path):
+        return path
+
+    try:
+        if _TTS_AVAILABLE:
+            engine = pyttsx3.init()
+            engine.save_to_file(text, path)
+            engine.runAndWait()
+            return path
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            import subprocess as _sub
+            safe_path = path.replace("'", "''")
+            safe_text = text.replace("'", "''")
+            cmd = [
+                "powershell",
+                "-Command",
+                f"Add-Type -AssemblyName System.speech; $s=(New-Object System.Speech.Synthesis.SpeechSynthesizer); $s.SetOutputToWaveFile('{safe_path}'); $s.Speak('{safe_text}'); $s.Dispose()",
+            ]
+            _sub.run(cmd, check=True, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+            if os.path.exists(path):
+                return path
+        except Exception:
+            pass
+
+    _generate_tone_wav_file(path)
+    return path
+
+
+def _play_audio_file(path):
+    try:
+        if os.name == "nt" and _WINSOUND_AVAILABLE:
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return True
+    except Exception:
+        pass
+
+    try:
+        import simpleaudio as sa
+        import wave
+        with wave.open(path, 'rb') as wf:
+            data = wf.readframes(wf.getnframes())
+            play_obj = sa.play_buffer(data, wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def announce_label(text):
+    """Announce a label non-blocking. Prefer label audio file, then TTS; fallback to beep."""
+
+    def _worker():
+        try:
+            os.makedirs(AUDIO_LABELS_DIR, exist_ok=True)
+            audio_path = _get_label_audio_path(text)
+            if not os.path.exists(audio_path):
+                _save_label_audio_file(audio_path, text)
+                print(f"announce_label: saved label audio to {audio_path}", file=sys.stderr)
+
+            if os.path.exists(audio_path) and _play_audio_file(audio_path):
+                print(f"announce_label: played audio file {audio_path}", file=sys.stderr)
+                return
+
+            print(f"announce_label: attempt announce '{text}'", file=sys.stderr)
+
+            if _TTS_AVAILABLE and _tts_engine is not None:
+                try:
+                    _tts_engine.say(text)
+                    _tts_engine.runAndWait()
+                    print("announce_label: TTS succeeded", file=sys.stderr)
+                    return
+                except Exception as e:
+                    print(f"announce_label: TTS failed: {e}", file=sys.stderr)
+
+            if os.name == "nt":
+                try:
+                    import subprocess as _sub
+                    ps_text = text.replace('"', '\\"')
+                    cmd = [
+                        "powershell",
+                        "-Command",
+                        f"Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak(\"{ps_text}\")",
+                    ]
+                    _sub.run(cmd, check=False, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+                    print("announce_label: PowerShell SAPI invoked", file=sys.stderr)
+                    return
+                except Exception as e:
+                    print(f"announce_label: PowerShell TTS failed: {e}", file=sys.stderr)
+
+            if _WINSOUND_AVAILABLE:
+                try:
+                    winsound.MessageBeep(winsound.MB_OK)
+                    print("announce_label: winsound.MessageBeep used", file=sys.stderr)
+                    return
+                except Exception as e:
+                    print(f"announce_label: MessageBeep failed: {e}", file=sys.stderr)
+
+                try:
+                    winsound.Beep(750, 180)
+                    print("announce_label: winsound.Beep used", file=sys.stderr)
+                    return
+                except Exception as e:
+                    print(f"announce_label: Beep failed: {e}", file=sys.stderr)
+
+            try:
+                def _generate_tone_wav(freq=750, ms=300, volume=0.3, sample_rate=44100):
+                    import struct, math, io, wave
+                    num_samples = int(sample_rate * (ms / 1000.0))
+                    buf = io.BytesIO()
+                    with wave.open(buf, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        max_amp = 32767 * volume
+                        for i in range(num_samples):
+                            t = float(i) / sample_rate
+                            val = int(max_amp * math.sin(2.0 * math.pi * freq * t))
+                            wf.writeframes(struct.pack('<h', val))
+                    return buf.getvalue()
+
+                wav_bytes = _generate_tone_wav()
+                try:
+                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
+                    print("announce_label: played in-memory WAV via winsound", file=sys.stderr)
+                    return
+                except Exception as e:
+                    print(f"announce_label: winsound PlaySound failed: {e}", file=sys.stderr)
+
+                try:
+                    import simpleaudio as sa
+                    import io, wave
+                    buf = io.BytesIO(wav_bytes)
+                    with wave.open(buf, 'rb') as wf:
+                        audio_data = wf.readframes(wf.getnframes())
+                        sa.play_buffer(audio_data, wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+                        print("announce_label: played WAV via simpleaudio", file=sys.stderr)
+                        return
+                except Exception as e:
+                    print(f"announce_label: simpleaudio failed: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"announce_label: WAV fallback generation failed: {e}", file=sys.stderr)
+        except Exception:
+            print("announce_label: unexpected error in worker", file=sys.stderr)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    # Quick manual test if run directly: python predict_sign.py --test-announce
+    import time as _time
+    if len(sys.argv) > 1 and sys.argv[1] in ("--test-announce", "test-announce"):
+        print("Running announcer test...", file=sys.stderr)
+        announce_label("สวัสดี")
+        _time.sleep(3)
+        print("Announcer test complete.", file=sys.stderr)
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
-
-import mediapipe as mp
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.vision import HolisticLandmarker
+   
+   
 from PIL import ImageFont, ImageDraw, Image
-import urllib.request
+from mediapipe_tracking import (
+    create_holistic_detector as build_holistic_detector,
+    detect_holistic_from_bgr,
+)
 
 _native_stderr_silenced = False
 
@@ -38,19 +258,6 @@ THAI_FONT_PATHS = [
     "C:/Windows/Fonts/cordia.ttc",
 ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "holistic_landmarker.task")
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "holistic_landmarker/holistic_landmarker/float16/1/holistic_landmarker.task"
-)
-
-def download_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Downloading holistic_landmarker.task ...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("Download complete.")
-
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -66,6 +273,10 @@ POSE_CONNECTIONS = [
 
 EXPECTED_FRAME_FEATURES = 1090
 POSE_HAND_START_INDEX = 936
+
+
+def create_holistic_detector(base_dir):
+    return build_holistic_detector(base_dir=base_dir)
 
 
 def load_thai_font(size=28):
@@ -107,37 +318,6 @@ def draw_text_thai(frame, text, pos=(10, 30), color=(255, 255, 255)):
     )
     draw.text(pos, text, font=_thai_font, fill=color)
     return np.array(img_pil)
-
-
-def prepare_frame_for_mediapipe(frame):
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_channel = clahe.apply(l_channel)
-    enhanced = cv2.cvtColor(
-        cv2.merge((l_channel, a_channel, b_channel)),
-        cv2.COLOR_LAB2BGR,
-    )
-
-    gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-    mean_brightness = float(np.mean(gray))
-
-    if mean_brightness < 95:
-        gamma = 0.75
-    elif mean_brightness > 175:
-        gamma = 1.25
-    else:
-        gamma = 1.0
-
-    if gamma != 1.0:
-        table = np.array([
-            ((i / 255.0) ** gamma) * 255
-            for i in range(256)
-        ], dtype=np.uint8)
-        enhanced = cv2.LUT(enhanced, table)
-
-    return enhanced
 
 
 def draw_landmarks(frame, pose_landmarks, left_landmarks, right_landmarks):
@@ -329,18 +509,7 @@ def main():
         print(f"Expected by scaler: {expected_feature_size} | New feature size: {new_feature_size}")
     print(f"ทดลองใช้ได้ตอนนี้: {', '.join(label_classes)}")
 
-    download_model()
-    base_options = mp.tasks.BaseOptions(model_asset_path=MODEL_PATH)
-    holistic_options = vision.HolisticLandmarkerOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE,
-        min_face_detection_confidence=0.5,
-        min_pose_detection_confidence=0.5,
-        min_hand_landmarks_confidence=0.5,
-        min_face_landmarks_confidence=0.5,
-        min_pose_landmarks_confidence=0.5,
-    )
-    holistic = HolisticLandmarker.create_from_options(holistic_options)
+    holistic = create_holistic_detector(base_dir)
     silence_native_stderr()
 
     cap = open_webcam()
@@ -354,8 +523,10 @@ def main():
     buffer_size = 5
     min_sequence_len = 10
     reset_when_hand_missing = True
-    confidence_threshold = 0.50
+    confidence_threshold = 0.40
     failed_frames = 0
+    last_timestamp_ms = 0
+    last_announced_label = None
 
     print("Realtime prediction เริ่มทำงาน: วางมือให้เห็นชัด แล้วระบบจะทำนายอัตโนมัติ")
     print("กด Q เพื่อออก, กด C เพื่อล้าง sequence ปัจจุบัน")
@@ -373,15 +544,12 @@ def main():
 
         failed_frames = 0
 
-        mediapipe_frame = prepare_frame_for_mediapipe(frame)
-        image = cv2.cvtColor(mediapipe_frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-        results = holistic.detect(mp_image)
-
-        face_lms = results.face_landmarks if results.face_landmarks else []
-        pose_lms = results.pose_landmarks if results.pose_landmarks else []
-        left_lms = results.left_hand_landmarks if results.left_hand_landmarks else []
-        right_lms = results.right_hand_landmarks if results.right_hand_landmarks else []
+        last_timestamp_ms = max(int(time.time() * 1000), last_timestamp_ms + 1)
+        face_lms, pose_lms, left_lms, right_lms = detect_holistic_from_bgr(
+            holistic,
+            frame,
+            last_timestamp_ms,
+        )
         has_hand = bool(left_lms or right_lms)
 
         if has_hand:
@@ -393,6 +561,7 @@ def main():
             if reset_when_hand_missing:
                 sequence.clear()
                 prediction_buffer.clear()
+                last_announced_label = None
 
         frame = draw_landmarks(frame, pose_lms, left_lms, right_lms)
 
@@ -423,6 +592,13 @@ def main():
 
             if avg_confidence >= confidence_threshold:
                 predicted_text = f"ท่าที่ทำนาย: {avg_label}"
+                # Announce when a new label is detected (non-blocking)
+                try:
+                    if avg_label != last_announced_label:
+                        announce_label(str(avg_label))
+                        last_announced_label = avg_label
+                except Exception:
+                    pass
             else:
                 predicted_text = "ไม่มั่นใจ - ทำท่าใหม่ให้ชัด"
             confidence_text = f"ความมั่นใจ: {avg_confidence:.0%} | {prob_str}"
@@ -430,12 +606,6 @@ def main():
         frame = draw_text_thai(frame, predicted_text, pos=(10, 10), color=(220, 220, 220))
         if confidence_text:
             frame = draw_text_thai(frame, confidence_text, pos=(10, 46), color=(220, 220, 0))
-        frame = draw_text_thai(
-            frame,
-            f"โหมดลองใช้: {', '.join(label_classes)}",
-            pos=(10, 82),
-            color=(80, 220, 255),
-        )
 
         cv2.imshow("Sign Language Prediction", frame)
 
